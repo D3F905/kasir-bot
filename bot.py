@@ -4,19 +4,16 @@ import base64
 import sqlite3
 import logging
 import requests
+import asyncio
 from datetime import datetime, date
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from calendar import monthrange
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-ALLOWED_USER_ID = os.environ.get("ALLOWED_USER_ID", "")  # opsional, biar bot private
-
-DB_PATH = os.environ.get("DB_PATH", "kasir.db")
+ALLOWED_USER_ID = os.environ.get("ALLOWED_USER_ID", "")
+DB_PATH = "kasir.db"
 
 # ── Database ──────────────────────────────────────────────
 def init_db():
@@ -52,9 +49,9 @@ def save_tx(user_id, data):
         str(user_id),
         data.get("vendor", "Unknown"),
         data.get("date", str(date.today())),
-        float(data.get("subtotal", 0) or 0),
-        float(data.get("tax", 0) or 0),
-        float(data.get("total", 0) or 0),
+        float(data.get("subtotal") or 0),
+        float(data.get("tax") or 0),
+        float(data.get("total") or 0),
         data.get("category", "Lainnya"),
         data.get("ref", ""),
         data.get("type", "expense"),
@@ -63,9 +60,7 @@ def save_tx(user_id, data):
         datetime.now().isoformat()
     ))
     conn.commit()
-    tx_id = c.lastrowid
     conn.close()
-    return tx_id
 
 def get_summary(user_id, period="month"):
     conn = sqlite3.connect(DB_PATH)
@@ -83,9 +78,9 @@ def get_summary(user_id, period="month"):
 
     c.execute(f"""
         SELECT 
-            SUM(CASE WHEN type='income' THEN total ELSE 0 END) as income,
-            SUM(CASE WHEN type='expense' THEN total ELSE 0 END) as expense,
-            COUNT(*) as count
+            SUM(CASE WHEN type='income' THEN total ELSE 0 END),
+            SUM(CASE WHEN type='expense' THEN total ELSE 0 END),
+            COUNT(*)
         FROM transactions 
         WHERE user_id=? {date_filter}
     """, (str(user_id),))
@@ -109,8 +104,8 @@ def get_summary(user_id, period="month"):
         LIMIT 5
     """, (str(user_id),))
     recent = c.fetchall()
-
     conn.close()
+
     return {
         "income": row[0] or 0,
         "expense": row[1] or 0,
@@ -134,10 +129,7 @@ def get_pending(user_id):
 def delete_last_tx(user_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("""
-        SELECT id FROM transactions WHERE user_id=?
-        ORDER BY created_at DESC LIMIT 1
-    """, (str(user_id),))
+    c.execute("SELECT id FROM transactions WHERE user_id=? ORDER BY created_at DESC LIMIT 1", (str(user_id),))
     row = c.fetchone()
     if row:
         c.execute("DELETE FROM transactions WHERE id=?", (row[0],))
@@ -148,33 +140,21 @@ def delete_last_tx(user_id):
     return False
 
 # ── Gemini OCR ────────────────────────────────────────────
-def ocr_invoice(image_bytes, mime_type="image/jpeg"):
+def ocr_invoice(image_bytes):
     if not GEMINI_API_KEY:
-        return None, "GEMINI_API_KEY belum diset di environment variable."
+        return None, "GEMINI_API_KEY belum diset."
 
     b64 = base64.b64encode(image_bytes).decode()
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
 
-    prompt = """Kamu adalah sistem OCR invoice/struk keuangan. Analisis gambar ini dan ekstrak data keuangan.
-Kembalikan HANYA JSON berikut (tanpa markdown, tanpa backtick, tanpa penjelasan):
-{
-  "vendor": "nama toko/vendor/perusahaan",
-  "date": "YYYY-MM-DD",
-  "subtotal": angka_atau_0,
-  "tax": angka_pajak_atau_0,
-  "total": angka_total,
-  "category": "Makanan & Minuman|Transport|Belanja|Tagihan & Utilitas|Kesehatan|Hiburan|Pendidikan|Bisnis|Invoice|Lainnya",
-  "ref": "nomor invoice/ref atau string kosong",
-  "type": "expense atau income",
-  "status": "lunas atau belum atau pending",
-  "notes": "catatan singkat atau string kosong"
-}
-Jika gambar bukan invoice, tetap kembalikan JSON dengan estimasi terbaik."""
+    prompt = """Kamu adalah sistem OCR invoice/struk keuangan. Analisis gambar dan ekstrak data.
+Kembalikan HANYA JSON ini (tanpa markdown, tanpa backtick):
+{"vendor":"nama toko","date":"YYYY-MM-DD","subtotal":0,"tax":0,"total":0,"category":"Makanan & Minuman|Transport|Belanja|Tagihan & Utilitas|Kesehatan|Hiburan|Bisnis|Invoice|Lainnya","ref":"","type":"expense","status":"lunas","notes":""}"""
 
     payload = {
         "contents": [{
             "parts": [
-                {"inline_data": {"mime_type": mime_type, "data": b64}},
+                {"inline_data": {"mime_type": "image/jpeg", "data": b64}},
                 {"text": prompt}
             ]
         }]
@@ -186,19 +166,14 @@ Jika gambar bukan invoice, tetap kembalikan JSON dengan estimasi terbaik."""
         data = res.json()
         text = data["candidates"][0]["content"]["parts"][0]["text"]
         text = text.replace("```json", "").replace("```", "").strip()
-        result = json.loads(text)
-        return result, None
-    except requests.exceptions.Timeout:
-        return None, "Request timeout. Coba lagi."
-    except json.JSONDecodeError:
-        return None, "Gagal parse response AI. Coba foto yang lebih jelas."
+        return json.loads(text), None
     except Exception as e:
-        return None, f"Error: {str(e)}"
+        return None, str(e)
 
 # ── Helpers ───────────────────────────────────────────────
 def fmt_rp(n):
     try:
-        return f"Rp {int(float(n)):,}".replace(",", ".")
+        return "Rp {:,}".format(int(float(n))).replace(",", ".")
     except:
         return "Rp 0"
 
@@ -207,198 +182,162 @@ def is_allowed(user_id):
         return True
     return str(user_id) == str(ALLOWED_USER_ID)
 
-def main_keyboard():
-    return ReplyKeyboardMarkup([
-        [KeyboardButton("📊 Hari Ini"), KeyboardButton("📅 Bulan Ini")],
-        [KeyboardButton("💰 Belum Dibayar"), KeyboardButton("📈 Tahun Ini")],
-        [KeyboardButton("❓ Bantuan")]
-    ], resize_keyboard=True)
+def esc(text):
+    text = str(text)
+    for c in r'_*[]()~`>#+-=|{}.!':
+        text = text.replace(c, f'\\{c}')
+    return text
 
-# ── Handlers ──────────────────────────────────────────────
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+# ── Bot Handlers ──────────────────────────────────────────
+async def start(update, context):
     if not is_allowed(update.effective_user.id):
-        await update.message.reply_text("⛔ Akses tidak diizinkan.")
+        await update.message.reply_text("Akses tidak diizinkan.")
         return
     name = update.effective_user.first_name
     await update.message.reply_text(
-        f"👋 Halo *{name}*\\! Selamat datang di *Kasir Bot*\\.\n\n"
-        f"Cara pakai:\n"
-        f"📸 *Kirim foto invoice* → AI langsung baca otomatis\n"
-        f"📊 Ketik /hari atau /bulan untuk laporan\n"
-        f"💰 Ketik /pending untuk tagihan belum dibayar\n"
-        f"❌ Ketik /hapus untuk batalkan input terakhir\n\n"
-        f"Langsung kirim foto invoice pertama kamu\\!",
-        parse_mode="MarkdownV2",
-        reply_markup=main_keyboard()
-    )
-
-async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update.effective_user.id):
-        return
-    await update.message.reply_text(
-        "📖 *Perintah yang tersedia:*\n\n"
-        "📸 *Kirim foto* → OCR invoice otomatis\n"
+        f"Halo {name}! Selamat datang di Kasir Bot.\n\n"
+        "Cara pakai:\n"
+        "📸 Kirim foto invoice/struk → AI baca otomatis\n"
         "📊 /hari → Laporan hari ini\n"
         "📅 /bulan → Laporan bulan ini\n"
         "📈 /tahun → Laporan tahun ini\n"
         "💰 /pending → Tagihan belum dibayar\n"
         "❌ /hapus → Hapus transaksi terakhir\n\n"
-        "Atau tekan tombol di bawah\\!",
-        parse_mode="MarkdownV2",
-        reply_markup=main_keyboard()
+        "Langsung kirim foto invoice pertama kamu!"
     )
 
-async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def handle_photo(update, context):
     if not is_allowed(update.effective_user.id):
-        await update.message.reply_text("⛔ Akses tidak diizinkan.")
         return
 
-    await update.message.reply_text("🔍 Lagi baca invoice lo\\.\\.\\.", parse_mode="MarkdownV2")
+    await update.message.reply_text("🔍 Lagi baca invoice lo...")
 
     photo = update.message.photo[-1]
-    file = await ctx.bot.get_file(photo.file_id)
+    file = await context.bot.get_file(photo.file_id)
     image_bytes = await file.download_as_bytearray()
 
     result, error = ocr_invoice(bytes(image_bytes))
 
     if error:
-        await update.message.reply_text(f"❌ Gagal membaca invoice: {error}")
+        await update.message.reply_text(f"❌ Gagal membaca: {error}")
         return
 
-    tx_id = save_tx(update.effective_user.id, result)
+    save_tx(update.effective_user.id, result)
 
+    status_label = {"lunas": "✅ Lunas", "belum": "⏳ Belum dibayar", "pending": "🔄 Pending"}.get(result.get("status", "lunas"), "✅ Lunas")
     tx_type = "💸 Pengeluaran" if result.get("type") == "expense" else "💰 Pemasukan"
-    status_emoji = {"lunas": "✅", "belum": "⏳", "pending": "🔄"}.get(result.get("status", "lunas"), "✅")
-    status_label = {"lunas": "Lunas", "belum": "Belum dibayar", "pending": "Pending"}.get(result.get("status", "lunas"), "Lunas")
 
     msg = (
-        f"✅ *Invoice berhasil dicatat\\!*\n\n"
-        f"🏪 *Vendor:* {escape_md(result.get('vendor', '-'))}\n"
-        f"📅 *Tanggal:* {result.get('date', '-')}\n"
-        f"🏷️ *Kategori:* {escape_md(result.get('category', '-'))}\n"
+        f"✅ Invoice berhasil dicatat!\n\n"
+        f"🏪 Vendor: {result.get('vendor', '-')}\n"
+        f"📅 Tanggal: {result.get('date', '-')}\n"
+        f"🏷️ Kategori: {result.get('category', '-')}\n"
     )
     if result.get("subtotal"):
-        msg += f"💵 *Subtotal:* {escape_md(fmt_rp(result['subtotal']))}\n"
+        msg += f"💵 Subtotal: {fmt_rp(result['subtotal'])}\n"
     if result.get("tax"):
-        msg += f"🧾 *Pajak:* {escape_md(fmt_rp(result['tax']))}\n"
+        msg += f"🧾 Pajak: {fmt_rp(result['tax'])}\n"
     msg += (
-        f"💰 *Total:* {escape_md(fmt_rp(result.get('total', 0)))}\n"
+        f"💰 Total: {fmt_rp(result.get('total', 0))}\n"
         f"{tx_type}\n"
-        f"{status_emoji} *Status:* {status_label}\n"
+        f"{status_label}\n"
     )
     if result.get("ref"):
-        msg += f"🔖 *Ref:* {escape_md(result['ref'])}\n"
+        msg += f"🔖 Ref: {result['ref']}\n"
     if result.get("notes"):
-        msg += f"📝 *Catatan:* {escape_md(result['notes'])}\n"
-    msg += f"\n_Ketik /hapus kalau mau batalin input ini_"
+        msg += f"📝 {result['notes']}\n"
+    msg += "\nKetik /hapus kalau mau batalin input ini"
 
-    await update.message.reply_text(msg, parse_mode="MarkdownV2", reply_markup=main_keyboard())
+    await update.message.reply_text(msg)
 
-async def laporan(update: Update, ctx: ContextTypes.DEFAULT_TYPE, period="month"):
+async def laporan_cmd(update, context, period="month"):
     if not is_allowed(update.effective_user.id):
         return
-    user_id = update.effective_user.id
-    data = get_summary(user_id, period)
-
-    period_label = {"today": "Hari Ini", "month": "Bulan Ini", "year": "Tahun Ini"}.get(period, "Semua")
-    emoji = {"today": "📊", "month": "📅", "year": "📈"}.get(period, "📊")
-
+    data = get_summary(update.effective_user.id, period)
+    label = {"today": "Hari Ini", "month": "Bulan Ini", "year": "Tahun Ini"}.get(period)
     balance = data["income"] - data["expense"]
-    bal_emoji = "🟢" if balance >= 0 else "🔴"
+    bal_mark = "🟢" if balance >= 0 else "🔴"
 
     msg = (
-        f"{emoji} *Laporan {period_label}*\n"
-        f"{'─' * 25}\n"
-        f"💰 Pemasukan:   {escape_md(fmt_rp(data['income']))}\n"
-        f"💸 Pengeluaran: {escape_md(fmt_rp(data['expense']))}\n"
-        f"{bal_emoji} Saldo:       {escape_md(fmt_rp(balance))}\n"
-        f"📋 Transaksi:   {data['count']} transaksi\n"
+        f"📊 Laporan {label}\n"
+        f"{'─'*25}\n"
+        f"💰 Pemasukan:   {fmt_rp(data['income'])}\n"
+        f"💸 Pengeluaran: {fmt_rp(data['expense'])}\n"
+        f"{bal_mark} Saldo:       {fmt_rp(balance)}\n"
+        f"📋 Transaksi:   {data['count']}\n"
     )
-
     if data["categories"]:
-        msg += f"\n🏷️ *Top Kategori Pengeluaran:*\n"
+        msg += "\n🏷️ Top Kategori:\n"
         for cat, total in data["categories"]:
-            bar = "█" * min(int(total / max(data["expense"], 1) * 10), 10)
-            msg += f"  • {escape_md(cat)}: {escape_md(fmt_rp(total))}\n"
-
+            msg += f"  • {cat}: {fmt_rp(total)}\n"
     if data["recent"]:
-        msg += f"\n🕐 *Transaksi Terakhir:*\n"
+        msg += "\n🕐 Terakhir:\n"
         for vendor, tx_date, total, tx_type, status in data["recent"]:
-            sign = "\\-" if tx_type == "expense" else "\\+"
+            sign = "-" if tx_type == "expense" else "+"
             st = {"lunas": "✅", "belum": "⏳", "pending": "🔄"}.get(status, "✅")
-            msg += f"  {st} {escape_md(vendor)} {sign}{escape_md(fmt_rp(total))}\n"
+            msg += f"  {st} {vendor} {sign}{fmt_rp(total)}\n"
 
-    await update.message.reply_text(msg, parse_mode="MarkdownV2", reply_markup=main_keyboard())
+    await update.message.reply_text(msg)
 
-async def hari(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await laporan(update, ctx, "today")
+async def hari(update, context):
+    await laporan_cmd(update, context, "today")
 
-async def bulan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await laporan(update, ctx, "month")
+async def bulan(update, context):
+    await laporan_cmd(update, context, "month")
 
-async def tahun(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await laporan(update, ctx, "year")
+async def tahun(update, context):
+    await laporan_cmd(update, context, "year")
 
-async def pending(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def pending(update, context):
     if not is_allowed(update.effective_user.id):
         return
     rows = get_pending(update.effective_user.id)
     if not rows:
-        await update.message.reply_text("✅ Tidak ada tagihan yang belum dibayar\\!", parse_mode="MarkdownV2", reply_markup=main_keyboard())
+        await update.message.reply_text("✅ Tidak ada tagihan yang belum dibayar!")
         return
     total = sum(r[2] for r in rows)
-    msg = f"⏳ *Tagihan Belum Dibayar*\n{'─'*25}\n"
+    msg = "⏳ Tagihan Belum Dibayar\n" + "─"*25 + "\n"
     for vendor, tx_date, tx_total, ref in rows:
-        msg += f"  • {escape_md(vendor)} — {escape_md(fmt_rp(tx_total))}"
+        msg += f"• {vendor} — {fmt_rp(tx_total)}"
         if ref:
-            msg += f" \\({escape_md(ref)}\\)"
-        msg += f"\n    📅 {tx_date}\n"
-    msg += f"\n💰 *Total: {escape_md(fmt_rp(total))}*"
-    await update.message.reply_text(msg, parse_mode="MarkdownV2", reply_markup=main_keyboard())
+            msg += f" ({ref})"
+        msg += f"\n  📅 {tx_date}\n"
+    msg += f"\n💰 Total: {fmt_rp(total)}"
+    await update.message.reply_text(msg)
 
-async def hapus(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def hapus(update, context):
     if not is_allowed(update.effective_user.id):
         return
     ok = delete_last_tx(update.effective_user.id)
     if ok:
-        await update.message.reply_text("✅ Transaksi terakhir berhasil dihapus\\.", parse_mode="MarkdownV2", reply_markup=main_keyboard())
+        await update.message.reply_text("✅ Transaksi terakhir berhasil dihapus.")
     else:
-        await update.message.reply_text("❌ Tidak ada transaksi yang bisa dihapus\\.", parse_mode="MarkdownV2", reply_markup=main_keyboard())
+        await update.message.reply_text("❌ Tidak ada transaksi yang bisa dihapus.")
 
-async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def handle_text(update, context):
     if not is_allowed(update.effective_user.id):
         return
-    text = update.message.text
-    if "hari" in text.lower():
-        await laporan(update, ctx, "today")
-    elif "bulan" in text.lower():
-        await laporan(update, ctx, "month")
-    elif "tahun" in text.lower():
-        await laporan(update, ctx, "year")
-    elif "belum" in text.lower() or "pending" in text.lower():
-        await pending(update, ctx)
-    elif "bantuan" in text.lower() or "help" in text.lower():
-        await help_cmd(update, ctx)
+    text = update.message.text.lower()
+    if "hari" in text:
+        await laporan_cmd(update, context, "today")
+    elif "bulan" in text:
+        await laporan_cmd(update, context, "month")
+    elif "tahun" in text:
+        await laporan_cmd(update, context, "year")
+    elif "pending" in text or "belum" in text:
+        await pending(update, context)
     else:
-        await update.message.reply_text(
-            "📸 Kirim foto invoice untuk dicatat, atau tekan tombol di bawah untuk laporan\\.",
-            parse_mode="MarkdownV2",
-            reply_markup=main_keyboard()
-        )
-
-def escape_md(text):
-    text = str(text)
-    chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
-    for c in chars:
-        text = text.replace(c, f'\\{c}')
-    return text
+        await update.message.reply_text("📸 Kirim foto invoice untuk dicatat, atau ketik /bulan untuk laporan.")
 
 # ── Main ──────────────────────────────────────────────────
 def main():
+    from telegram.ext import Application, CommandHandler, MessageHandler, filters
+
     init_db()
+    logger.info("Starting bot...")
+
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("hari", hari))
     app.add_handler(CommandHandler("bulan", bulan))
     app.add_handler(CommandHandler("tahun", tahun))
@@ -406,8 +345,9 @@ def main():
     app.add_handler(CommandHandler("hapus", hapus))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    logger.info("Bot started!")
-    app.run_polling(drop_pending_updates=True)
+
+    logger.info("Bot running!")
+    app.run_polling(allowed_updates=["message"])
 
 if __name__ == "__main__":
     main()
