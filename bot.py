@@ -148,7 +148,6 @@ def ocr_invoice(image_bytes):
         return None, "GEMINI_API_KEY belum diset."
 
     b64 = base64.b64encode(image_bytes).decode()
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
 
     prompt = """Kamu adalah sistem OCR invoice/struk keuangan. Analisis gambar dan ekstrak data.
 Kembalikan HANYA JSON ini (tanpa markdown, tanpa backtick, langsung JSON):
@@ -164,8 +163,27 @@ Pilihan category: Makanan & Minuman, Transport, Belanja, Tagihan & Utilitas, Kes
         }]
     }
 
+    # Coba pakai header Authorization dulu (untuk key format AQ...)
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {GEMINI_API_KEY}"
+    }
+    url_header = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+
     try:
-        res = requests.post(url, json=payload, timeout=30)
+        res = requests.post(url_header, json=payload, headers=headers, timeout=30)
+        if res.status_code == 200:
+            data = res.json()
+            text = data["candidates"][0]["content"]["parts"][0]["text"]
+            text = text.replace("```json", "").replace("```", "").strip()
+            return json.loads(text), None
+    except Exception as e:
+        logger.warning(f"Header auth failed: {e}")
+
+    # Fallback: pakai query param (untuk key format AIzaSy...)
+    url_param = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+    try:
+        res = requests.post(url_param, json=payload, timeout=30)
         res.raise_for_status()
         data = res.json()
         text = data["candidates"][0]["content"]["parts"][0]["text"]
@@ -173,7 +191,7 @@ Pilihan category: Makanan & Minuman, Transport, Belanja, Tagihan & Utilitas, Kes
         return json.loads(text), None
     except Exception as e:
         logger.error(f"OCR error: {e}")
-        return None, str(e)
+        return None, f"Gagal: {str(e)[:100]}"
 
 # ── Helpers ───────────────────────────────────────────────
 def fmt_rp(n):
@@ -282,11 +300,10 @@ def handle_photo(message):
     try:
         file_info = bot.get_file(message.photo[-1].file_id)
         downloaded = bot.download_file(file_info.file_path)
-
         result, error = ocr_invoice(downloaded)
 
         if error:
-            bot.reply_to(message, f"❌ Gagal membaca: {error}")
+            bot.reply_to(message, f"❌ {error}")
             return
 
         save_tx(message.from_user.id, result)
@@ -294,32 +311,28 @@ def handle_photo(message):
         status_label = {"lunas": "✅ Lunas", "belum": "⏳ Belum dibayar", "pending": "🔄 Pending"}.get(result.get("status", "lunas"), "✅ Lunas")
         tx_type = "💸 Pengeluaran" if result.get("type") == "expense" else "💰 Pemasukan"
 
-        msg = (
-            f"✅ Invoice berhasil dicatat!\n\n"
-            f"🏪 Vendor: {result.get('vendor', '-')}\n"
-            f"📅 Tanggal: {result.get('date', '-')}\n"
-            f"🏷️ Kategori: {result.get('category', '-')}\n"
-        )
+        msg = f"✅ Invoice berhasil dicatat!\n\n"
+        msg += f"🏪 Vendor: {result.get('vendor', '-')}\n"
+        msg += f"📅 Tanggal: {result.get('date', '-')}\n"
+        msg += f"🏷️ Kategori: {result.get('category', '-')}\n"
         if result.get("subtotal"):
             msg += f"💵 Subtotal: {fmt_rp(result['subtotal'])}\n"
         if result.get("tax"):
             msg += f"🧾 Pajak: {fmt_rp(result['tax'])}\n"
-        msg += (
-            f"💰 Total: {fmt_rp(result.get('total', 0))}\n"
-            f"{tx_type}\n"
-            f"{status_label}\n"
-        )
+        msg += f"💰 Total: {fmt_rp(result.get('total', 0))}\n"
+        msg += f"{tx_type}\n"
+        msg += f"{status_label}\n"
         if result.get("ref"):
             msg += f"🔖 Ref: {result['ref']}\n"
         if result.get("notes"):
             msg += f"📝 {result['notes']}\n"
-        msg += "\nKetik /hapus kalau mau batalin input ini"
+        msg += "\nKetik /hapus kalau mau batalin"
 
         bot.reply_to(message, msg)
 
     except Exception as e:
-        logger.error(f"Photo handler error: {e}")
-        bot.reply_to(message, f"❌ Error: {str(e)}")
+        logger.error(f"Error: {e}")
+        bot.reply_to(message, f"❌ Error: {str(e)[:100]}")
 
 @bot.message_handler(func=lambda m: True)
 def handle_text(message):
