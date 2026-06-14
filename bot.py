@@ -185,7 +185,7 @@ Jika tidak ada tanggal gunakan hari ini. Jika tidak ada pajak isi 0."""
 
     try:
         res = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
+            "https://openrouter.ai/api/v1/chat/completions"
             json=payload,
             headers=headers,
             timeout=30
