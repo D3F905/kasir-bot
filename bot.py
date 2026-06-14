@@ -156,7 +156,7 @@ Pilihan category: Makanan & Minuman, Transport, Belanja, Tagihan & Utilitas, Kes
 Jika tidak ada tanggal gunakan hari ini. Jika tidak ada pajak isi 0."""
 
     payload = {
-        "model": "google/gemini-2.0-flash-thinking-exp:free",
+        "model": "qwen/qwen-2-vl-7b-instruct:free",
         "messages": [
             {
                 "role": "user",
