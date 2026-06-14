@@ -12,7 +12,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+OPENROUTER_KEY = os.environ.get("OPENROUTER_KEY", "")
 ALLOWED_USER_ID = os.environ.get("ALLOWED_USER_ID", "")
 DB_PATH = "kasir.db"
 
@@ -142,56 +142,62 @@ def delete_last_tx(user_id):
     conn.close()
     return False
 
-# ── Gemini OCR ────────────────────────────────────────────
+# ── OCR via OpenRouter ────────────────────────────────────
 def ocr_invoice(image_bytes):
-    if not GEMINI_API_KEY:
-        return None, "GEMINI_API_KEY belum diset."
+    if not OPENROUTER_KEY:
+        return None, "OPENROUTER_KEY belum diset di Railway Variables."
 
     b64 = base64.b64encode(image_bytes).decode()
 
-    prompt = """Kamu adalah sistem OCR invoice/struk keuangan. Analisis gambar dan ekstrak data.
-Kembalikan HANYA JSON ini (tanpa markdown, tanpa backtick, langsung JSON):
-{"vendor":"nama toko","date":"YYYY-MM-DD","subtotal":0,"tax":0,"total":0,"category":"Makanan & Minuman","ref":"","type":"expense","status":"lunas","notes":""}
-Pilihan category: Makanan & Minuman, Transport, Belanja, Tagihan & Utilitas, Kesehatan, Hiburan, Bisnis, Invoice, Lainnya"""
+    prompt = """Kamu adalah sistem OCR invoice/struk keuangan. Analisis gambar dan ekstrak data keuangan.
+Kembalikan HANYA JSON berikut (tanpa markdown, tanpa backtick, langsung JSON mentah):
+{"vendor":"nama toko/vendor","date":"YYYY-MM-DD","subtotal":0,"tax":0,"total":0,"category":"Makanan & Minuman","ref":"","type":"expense","status":"lunas","notes":""}
+Pilihan category: Makanan & Minuman, Transport, Belanja, Tagihan & Utilitas, Kesehatan, Hiburan, Bisnis, Invoice, Lainnya
+Jika tidak ada tanggal gunakan hari ini. Jika tidak ada pajak isi 0."""
 
     payload = {
-        "contents": [{
-            "parts": [
-                {"inline_data": {"mime_type": "image/jpeg", "data": b64}},
-                {"text": prompt}
-            ]
-        }]
+        "model": "google/gemini-2.0-flash-exp:free",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{b64}"
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": prompt
+                    }
+                ]
+            }
+        ]
     }
 
-    # Coba pakai header Authorization dulu (untuk key format AQ...)
     headers = {
+        "Authorization": f"Bearer {OPENROUTER_KEY}",
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {GEMINI_API_KEY}"
+        "HTTP-Referer": "https://kasir-bot.railway.app",
+        "X-Title": "Kasir Bot"
     }
-    url_header = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
 
     try:
-        res = requests.post(url_header, json=payload, headers=headers, timeout=30)
-        if res.status_code == 200:
-            data = res.json()
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
-            text = text.replace("```json", "").replace("```", "").strip()
-            return json.loads(text), None
-    except Exception as e:
-        logger.warning(f"Header auth failed: {e}")
-
-    # Fallback: pakai query param (untuk key format AIzaSy...)
-    url_param = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
-    try:
-        res = requests.post(url_param, json=payload, timeout=30)
+        res = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            json=payload,
+            headers=headers,
+            timeout=30
+        )
         res.raise_for_status()
         data = res.json()
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        text = data["choices"][0]["message"]["content"]
         text = text.replace("```json", "").replace("```", "").strip()
         return json.loads(text), None
     except Exception as e:
         logger.error(f"OCR error: {e}")
-        return None, f"Gagal: {str(e)[:100]}"
+        return None, f"Gagal baca invoice: {str(e)[:100]}"
 
 # ── Helpers ───────────────────────────────────────────────
 def fmt_rp(n):
@@ -294,23 +300,17 @@ def hapus(message):
 @bot.message_handler(content_types=["photo"])
 def handle_photo(message):
     if not is_allowed(message.from_user.id): return
-
     bot.reply_to(message, "🔍 Lagi baca invoice lo...")
-
     try:
         file_info = bot.get_file(message.photo[-1].file_id)
         downloaded = bot.download_file(file_info.file_path)
         result, error = ocr_invoice(downloaded)
-
         if error:
             bot.reply_to(message, f"❌ {error}")
             return
-
         save_tx(message.from_user.id, result)
-
         status_label = {"lunas": "✅ Lunas", "belum": "⏳ Belum dibayar", "pending": "🔄 Pending"}.get(result.get("status", "lunas"), "✅ Lunas")
         tx_type = "💸 Pengeluaran" if result.get("type") == "expense" else "💰 Pemasukan"
-
         msg = f"✅ Invoice berhasil dicatat!\n\n"
         msg += f"🏪 Vendor: {result.get('vendor', '-')}\n"
         msg += f"📅 Tanggal: {result.get('date', '-')}\n"
@@ -327,9 +327,7 @@ def handle_photo(message):
         if result.get("notes"):
             msg += f"📝 {result['notes']}\n"
         msg += "\nKetik /hapus kalau mau batalin"
-
         bot.reply_to(message, msg)
-
     except Exception as e:
         logger.error(f"Error: {e}")
         bot.reply_to(message, f"❌ Error: {str(e)[:100]}")
