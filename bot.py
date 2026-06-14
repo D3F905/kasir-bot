@@ -156,7 +156,7 @@ Pilihan category: Makanan & Minuman, Transport, Belanja, Tagihan & Utilitas, Kes
 Jika tidak ada tanggal gunakan hari ini. Jika tidak ada pajak isi 0."""
 
     payload = {
-        "model": "meta-llama/llama-3.2-11b-vision-instruct:free",
+        "model": "google/gemini-2.0-flash-thinking-exp:free",
         "messages": [
             {
                 "role": "user",
@@ -185,7 +185,7 @@ Jika tidak ada tanggal gunakan hari ini. Jika tidak ada pajak isi 0."""
 
     try:
         res = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions"
+            "https://openrouter.ai/api/v1/chat/completions",
             json=payload,
             headers=headers,
             timeout=30
